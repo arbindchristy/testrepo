@@ -1,7 +1,14 @@
-CREATE OR ALTER VIEW vw_expert_job_monitoring
+CREATE OR ALTER VIEW vw_daily_0600_job_report
 AS
 WITH 
--- 1. Get ALL unique job names from both tables
+-- Current report time (simulate 06:00 runtime)
+ReportTime AS (
+    SELECT 
+        CAST(CAST(GETDATE() AS DATE) AS DATETIME) + '06:00' AS ReportRunTime,
+        CAST(CAST(DATEADD(DAY, -1, GETDATE()) AS DATE) AS DATETIME) + '06:00' AS Yesterday0600,
+        CAST(CAST(GETDATE() AS DATE) AS DATETIME) + '06:00' AS Today0600
+),
+-- 1. Get all active schedules
 AllJobNames AS (
     SELECT DISTINCT proc_def_id AS JobName 
     FROM adm_trn_jm_active_schedule
@@ -9,125 +16,145 @@ AllJobNames AS (
     UNION
     SELECT DISTINCT proc_def_ AS JobName 
     FROM adm_trn_job_instances
+    WHERE start_ >= DATEADD(DAY, -30, GETDATE()) -- Include recent jobs
 ),
--- 2. Get schedule details (job can have multiple schedules)
+-- 2. Get schedule details
 JobSchedules AS (
     SELECT 
         s.proc_def_id AS JobName,
-        s.id_ AS ScheduleId,
         s.period_ AS ScheduleType,
-        s.date_time_ AS ScheduledDateTime,
-        CAST(s.date_time_ AS TIME) AS ScheduledTime,
-        CAST(s.date_time_ AS DATE) AS ScheduledDate,
+        CAST(s.date_time_ AS TIME) AS ScheduledTime, -- Only time matters
         s.disabled_,
-        -- For daily jobs, calculate expected run times for today and yesterday
+        -- Calculate expected run time for report window
         CASE 
             WHEN s.period_ = 'Day' 
-            THEN DATEADD(DAY, DATEDIFF(DAY, s.date_time_, GETDATE()), 
-                         CAST(CAST(GETDATE() AS DATE) AS DATETIME) + 
-                         CAST(s.date_time_ AS TIME))
+            THEN CAST(rt.Yesterday0600 AS DATE) + CAST(s.date_time_ AS TIME)
             ELSE s.date_time_
-        END AS ExpectedToday,
-        CASE 
-            WHEN s.period_ = 'Day' 
-            THEN DATEADD(DAY, DATEDIFF(DAY, s.date_time_, GETDATE()) - 1, 
-                         CAST(CAST(GETDATE() AS DATE) AS DATETIME) + 
-                         CAST(s.date_time_ AS TIME))
-            ELSE NULL
-        END AS ExpectedYesterday
+        END AS ExpectedRunInWindow
     FROM adm_trn_jm_active_schedule s
+    CROSS JOIN ReportTime rt
     WHERE s.disabled_ = 0
 ),
--- 3. Get ALL job executions in the last 48 hours (for today + yesterday)
-RecentExecutions AS (
+-- 3. Get executions within the 24-hour report window (Yesterday 06:00 to Today 06:00)
+WindowExecutions AS (
     SELECT 
         j.proc_def_ AS JobName,
         j.start_,
         j.finish_,
         j.status_,
-        j.schedule_id_,
-        CAST(j.start_ AS DATE) AS RunDate,
         CAST(j.start_ AS TIME) AS RunTime,
         DATEDIFF(SECOND, j.start_, j.finish_) AS DurationSeconds,
-        -- Flag executions that happened within ±15 minutes of scheduled time
-        ROW_NUMBER() OVER (
-            PARTITION BY j.proc_def_, CAST(j.start_ AS DATE)
-            ORDER BY j.start_ DESC
-        ) AS DailyRunNumber
+        -- Categorize by time of day for analysis
+        CASE 
+            WHEN CAST(j.start_ AS TIME) BETWEEN '06:00' AND '13:59' THEN 'Morning'
+            WHEN CAST(j.start_ AS TIME) BETWEEN '14:00' AND '17:59' THEN 'Afternoon'
+            WHEN CAST(j.start_ AS TIME) BETWEEN '18:00' AND '23:59' THEN 'Evening'
+            WHEN CAST(j.start_ AS TIME) BETWEEN '00:00' AND '05:59' THEN 'Overnight'
+            ELSE 'Other'
+        END AS TimeCategory
     FROM adm_trn_job_instances j
-    WHERE j.start_ >= DATEADD(HOUR, -48, GETDATE()) -- Last 48 hours
+    CROSS JOIN ReportTime rt
+    WHERE j.start_ >= rt.Yesterday0600 
+      AND j.start_ < rt.Today0600  -- Exactly 24-hour window
 ),
--- 4. For each job, find the most relevant recent execution
-LatestRelevantExecution AS (
+-- 4. For each job, find if it ran in the window
+JobExecutionSummary AS (
     SELECT 
-        j.JobName,
-        j.start_ AS LastRunStart,
-        j.finish_ AS LastRunEnd,
-        j.status_ AS LastRunStatus,
-        j.DurationSeconds,
-        j.RunDate,
-        j.RunTime
-    FROM RecentExecutions j
-    WHERE j.DailyRunNumber = 1 -- Latest execution per day per job
-),
--- 5. Analyze each job's schedule vs actual execution
-JobAnalysis AS (
-    SELECT 
-        aj.JobName,
+        js.JobName,
         js.ScheduleType,
         js.ScheduledTime,
-        js.ExpectedToday,
-        js.ExpectedYesterday,
-        -- Determine if job should have run TODAY based on current time
+        js.ExpectedRunInWindow,
+        -- Latest execution in window
+        MAX(we.start_) AS LastRunStart,
+        MAX(we.finish_) AS LastRunEnd,
+        MAX(we.status_) AS LastRunStatus,
+        MAX(we.DurationSeconds) AS DurationSeconds,
+        MAX(we.TimeCategory) AS RunTimeCategory,
+        -- Count of executions
+        COUNT(we.JobName) AS TimesRanInWindow,
+        -- Flag for jobs that should have run in this window
         CASE 
             WHEN js.ScheduleType = 'Day' 
-                 AND js.ScheduledTime <= CAST(GETDATE() AS TIME) 
-                 AND CAST(GETDATE() AS TIME) < DATEADD(MINUTE, 30, js.ScheduledTime)
-            THEN 'SCHEDULED_NOW'
+                 AND js.ScheduledTime >= '06:00' -- Ran after start of window
+                 AND js.ScheduledTime < '06:00'  -- And before next window start
+            THEN 1
             WHEN js.ScheduleType = 'Day' 
-                 AND js.ScheduledTime <= CAST(GETDATE() AS TIME)
-                 AND lre.LastRunStart IS NULL
-            THEN 'MISSING_TODAY'
-            WHEN js.ScheduleType = 'Day' 
-                 AND js.ScheduledTime <= CAST(GETDATE() AS TIME)
-                 AND CAST(lre.LastRunStart AS DATE) < CAST(GETDATE() AS DATE)
-            THEN 'MISSING_TODAY'
-            ELSE NULL
-        END AS TodayStatus,
-        -- Check if job ran YESTERDAY
+                 AND (js.ScheduledTime < '06:00' OR js.ScheduledTime >= '00:00')
+                 -- Handle overnight jobs (like 23:45, 00:00, 01:00)
+                 AND js.ScheduledTime BETWEEN '00:00' AND '05:59'
+            THEN 1
+            ELSE 0
+        END AS ShouldHaveRunInWindow
+    FROM JobSchedules js
+    LEFT JOIN WindowExecutions we ON js.JobName = we.JobName
+    GROUP BY js.JobName, js.ScheduleType, js.ScheduledTime, js.ExpectedRunInWindow
+),
+-- 5. Analyze job performance
+JobAnalysis AS (
+    SELECT 
+        jes.*,
+        -- Determine status
         CASE 
-            WHEN js.ScheduleType = 'Day' 
-                 AND lre.LastRunStart IS NOT NULL
-                 AND CAST(lre.LastRunStart AS DATE) = CAST(DATEADD(DAY, -1, GETDATE()) AS DATE)
-            THEN 'RAN_YESTERDAY'
-            WHEN js.ScheduleType = 'Day' 
-                 AND lre.LastRunStart IS NULL
-            THEN 'MISSING_YESTERDAY'
-            WHEN js.ScheduleType = 'Day' 
-                 AND CAST(lre.LastRunStart AS DATE) < CAST(DATEADD(DAY, -1, GETDATE()) AS DATE)
-            THEN 'MISSING_YESTERDAY'
+            -- One-time jobs
+            WHEN jes.ScheduleType = 'Once' 
+                 AND jes.ExpectedRunInWindow < (SELECT Today0600 FROM ReportTime)
+                 AND jes.TimesRanInWindow = 0
+            THEN 'ONCE_SCHEDULE_MISSED'
+            
+            WHEN jes.ScheduleType = 'Once' 
+                 AND jes.ExpectedRunInWindow < (SELECT Today0600 FROM ReportTime)
+                 AND jes.TimesRanInWindow > 0
+            THEN 'ONCE_SCHEDULE_COMPLETED'
+            
+            -- Daily jobs
+            WHEN jes.ScheduleType = 'Day' 
+                 AND jes.ShouldHaveRunInWindow = 1 
+                 AND jes.TimesRanInWindow = 0
+            THEN 'DAILY_SCHEDULE_MISSED'
+            
+            WHEN jes.ScheduleType = 'Day' 
+                 AND jes.ShouldHaveRunInWindow = 1 
+                 AND jes.TimesRanInWindow > 0
+                 AND jes.LastRunStatus = 'COMPLETED'
+            THEN 'DAILY_SCHEDULE_COMPLETED'
+            
+            WHEN jes.ScheduleType = 'Day' 
+                 AND jes.ShouldHaveRunInWindow = 1 
+                 AND jes.TimesRanInWindow > 0
+                 AND jes.LastRunStatus = 'FAILED'
+            THEN 'DAILY_SCHEDULE_FAILED'
+            
+            WHEN jes.ScheduleType = 'Day' 
+                 AND jes.ShouldHaveRunInWindow = 0
+            THEN 'NOT_EXPECTED_IN_WINDOW'
+            
+            ELSE 'UNKNOWN_STATUS'
+        END AS AnalysisStatus,
+        
+        -- Calculate next expected run
+        CASE 
+            WHEN jes.ScheduleType = 'Day' 
+            THEN 
+                CASE 
+                    WHEN jes.ScheduledTime > '06:00' 
+                    THEN CAST(CAST(GETDATE() AS DATE) AS DATETIME) + jes.ScheduledTime
+                    ELSE CAST(CAST(DATEADD(DAY, 1, GETDATE()) AS DATE) AS DATETIME) + jes.ScheduledTime
+                END
             ELSE NULL
-        END AS YesterdayStatus,
-        lre.LastRunStart,
-        lre.LastRunEnd,
-        lre.LastRunStatus,
-        lre.DurationSeconds,
-        lre.RunTime AS ActualRunTime
-    FROM AllJobNames aj
-    LEFT JOIN JobSchedules js ON aj.JobName = js.JobName
-    LEFT JOIN LatestRelevantExecution lre ON aj.JobName = lre.JobName
+        END AS NextExpectedRun
+    FROM JobExecutionSummary jes
 )
--- 6. Final analysis with clear status indicators
+-- 6. Final formatted output
 SELECT 
     JobName,
     ScheduleType,
-    ScheduledTime,
-    -- Calculate expected next run
+    CONVERT(VARCHAR(8), ScheduledTime, 108) AS ScheduledTime,
     CASE 
-        WHEN ScheduleType = 'Day' 
-        THEN DATEADD(DAY, 1, CAST(CAST(GETDATE() AS DATE) AS DATETIME) + ScheduledTime)
-        ELSE NULL
-    END AS NextExpectedRun,
+        WHEN ScheduleType = 'Day' AND ShouldHaveRunInWindow = 1 
+        THEN 'Yes' 
+        ELSE 'No'
+    END AS ExpectedInLast24H,
+    TimesRanInWindow,
     LastRunStart,
     LastRunEnd,
     LastRunStatus,
@@ -135,98 +162,63 @@ SELECT
         WHEN DurationSeconds IS NOT NULL 
         THEN CONCAT(
             DurationSeconds/3600, 'h ', 
-            (DurationSeconds%3600)/60, 'm ', 
-            DurationSeconds%60, 's'
+            (DurationSeconds%3600)/60, 'm'
         )
         ELSE NULL
     END AS LastRunDuration,
-    -- Comprehensive status
-    CASE 
-        -- Edge Case 1: No schedule found (orphaned job)
-        WHEN ScheduleType IS NULL THEN '⚠️ NO ACTIVE SCHEDULE'
-        
-        -- Edge Case 2: "Once" schedule that already ran
-        WHEN ScheduleType = 'Once' AND LastRunStart IS NOT NULL 
-        THEN '✅ ONE-TIME JOB COMPLETED'
-        
-        -- Edge Case 3: "Once" schedule that hasn't run yet
-        WHEN ScheduleType = 'Once' AND LastRunStart IS NULL 
-             AND ExpectedToday <= GETDATE()
-        THEN '⏰ ONE-TIME JOB OVERDUE'
-        
-        -- Edge Case 4: "Once" schedule pending
-        WHEN ScheduleType = 'Once' AND LastRunStart IS NULL 
-        THEN '🔄 ONE-TIME JOB PENDING'
-        
-        -- Daily job analysis
-        WHEN TodayStatus = 'SCHEDULED_NOW' THEN '🔵 SHOULD BE RUNNING NOW'
-        
-        WHEN TodayStatus = 'MISSING_TODAY' 
-             AND CAST(GETDATE() AS TIME) > DATEADD(MINUTE, 15, ScheduledTime)
-        THEN '🔴 MISSED TODAY''S RUN'
-        
-        WHEN TodayStatus = 'MISSING_TODAY' 
-        THEN '🟡 NOT RUN YET TODAY'
-        
-        WHEN YesterdayStatus = 'MISSING_YESTERDAY' 
-             AND TodayStatus IS NULL
-        THEN '🟠 MISSED YESTERDAY''S RUN'
-        
-        WHEN LastRunStatus = 'FAILED' THEN '❌ LAST RUN FAILED'
-        
-        WHEN LastRunStatus = 'RUNNING' 
-             AND DATEDIFF(MINUTE, LastRunStart, GETDATE()) > 60
-        THEN '🟣 LONG RUNNING (>1hr)'
-        
-        WHEN LastRunStatus = 'RUNNING' THEN '🟢 CURRENTLY RUNNING'
-        
-        WHEN LastRunStatus = 'COMPLETED' 
-             AND CAST(LastRunStart AS DATE) = CAST(GETDATE() AS DATE)
-        THEN '✅ RAN TODAY'
-        
-        WHEN LastRunStatus = 'COMPLETED' 
-             AND CAST(LastRunStart AS DATE) = CAST(DATEADD(DAY, -1, GETDATE()) AS DATE)
-        THEN '✅ RAN YESTERDAY'
-        
-        ELSE 'ℹ️ ' + ISNULL(LastRunStatus, 'NO RECENT RUNS')
-    END AS CurrentStatus,
+    RunTimeCategory,
     
-    -- Time since last run
-    CASE 
-        WHEN LastRunStart IS NOT NULL 
-        THEN CONCAT(
-            DATEDIFF(HOUR, LastRunStart, GETDATE()), 'h ', 
-            DATEDIFF(MINUTE, LastRunStart, GETDATE()) % 60, 'm ago'
-        )
-        ELSE 'Never'
-    END AS TimeSinceLastRun,
+    -- User-friendly status
+    CASE AnalysisStatus
+        WHEN 'ONCE_SCHEDULE_MISSED' THEN '🔴 ONE-TIME JOB MISSED'
+        WHEN 'ONCE_SCHEDULE_COMPLETED' THEN '✅ ONE-TIME JOB COMPLETED'
+        WHEN 'DAILY_SCHEDULE_MISSED' THEN '🔴 DAILY JOB MISSED'
+        WHEN 'DAILY_SCHEDULE_COMPLETED' THEN '✅ DAILY JOB COMPLETED'
+        WHEN 'DAILY_SCHEDULE_FAILED' THEN '❌ DAILY JOB FAILED'
+        WHEN 'NOT_EXPECTED_IN_WINDOW' THEN 'ℹ️ NOT EXPECTED IN REPORT WINDOW'
+        ELSE '⚠️ ' + AnalysisStatus
+    END AS Status24H,
     
-    -- Recommended action
+    -- Summary for email subject
     CASE 
-        WHEN ScheduleType IS NULL THEN 'Add schedule or disable job'
-        WHEN ScheduleType = 'Once' AND LastRunStart IS NULL 
-             AND ExpectedToday <= GETDATE() THEN 'Run one-time job manually'
-        WHEN TodayStatus = 'MISSING_TODAY' 
-             AND CAST(GETDATE() AS TIME) > DATEADD(MINUTE, 15, ScheduledTime) 
-        THEN 'Investigate why job didn''t run'
-        WHEN YesterdayStatus = 'MISSING_YESTERDAY' THEN 'Check yesterday''s logs'
-        WHEN LastRunStatus = 'FAILED' THEN 'Review failure details'
-        WHEN LastRunStatus = 'RUNNING' 
-             AND DATEDIFF(MINUTE, LastRunStart, GETDATE()) > 60 
-        THEN 'Check for hung process'
-        ELSE 'Monitor'
-    END AS ActionRequired
+        WHEN AnalysisStatus IN ('DAILY_SCHEDULE_MISSED', 'ONCE_SCHEDULE_MISSED', 'DAILY_SCHEDULE_FAILED')
+        THEN 'REQUIRES ATTENTION'
+        WHEN AnalysisStatus = 'DAILY_SCHEDULE_COMPLETED' 
+        THEN 'COMPLETED SUCCESSFULLY'
+        ELSE 'INFORMATIONAL'
+    END AS Priority,
+    
+    NextExpectedRun,
+    
+    -- Action items
+    CASE 
+        WHEN AnalysisStatus = 'DAILY_SCHEDULE_MISSED' 
+        THEN 'Job scheduled at ' + CONVERT(VARCHAR(8), ScheduledTime, 108) + 
+             ' did not run in last 24h. Investigate.'
+             
+        WHEN AnalysisStatus = 'DAILY_SCHEDULE_FAILED' 
+        THEN 'Job failed at ' + CONVERT(VARCHAR(16), LastRunStart, 120) + 
+             '. Review error logs.'
+             
+        WHEN AnalysisStatus = 'ONCE_SCHEDULE_MISSED' 
+        THEN 'One-time job scheduled for ' + CONVERT(VARCHAR(16), ExpectedRunInWindow, 120) + 
+             ' did not run. Execute manually or reschedule.'
+             
+        WHEN AnalysisStatus = 'DAILY_SCHEDULE_COMPLETED' 
+        THEN 'Completed successfully in ' + 
+             CONCAT(DurationSeconds/3600, 'h ', (DurationSeconds%3600)/60, 'm')
+             
+        ELSE 'No action required'
+    END AS ActionItem
     
 FROM JobAnalysis
-WHERE ScheduleType IS NOT NULL -- Only show jobs with active schedules
+-- Only show jobs that were expected to run or had issues
+WHERE AnalysisStatus != 'NOT_EXPECTED_IN_WINDOW'
 ORDER BY 
-    CASE 
-        WHEN CurrentStatus LIKE '%MISSED%' THEN 1
-        WHEN CurrentStatus LIKE '%FAILED%' THEN 2
-        WHEN CurrentStatus LIKE '%OVERDUE%' THEN 3
-        WHEN CurrentStatus LIKE '%RUNNING%' THEN 4
-        WHEN CurrentStatus LIKE '%NOT RUN%' THEN 5
-        ELSE 6
+    CASE Priority
+        WHEN 'REQUIRES ATTENTION' THEN 1
+        WHEN 'INFORMATIONAL' THEN 2
+        ELSE 3
     END,
     ScheduledTime,
     JobName;
