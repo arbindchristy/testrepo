@@ -1,49 +1,162 @@
-CREATE OR ALTER PROCEDURE sp_GetExpertJobReport
-    @IncludeAllJobs BIT = 1  -- 1 = All jobs, 0 = Only issues
+CREATE OR ALTER PROCEDURE sp_Send0600JobStatusReport
+    @RecipientEmail NVARCHAR(255) = 'operations@company.com',
+    @IncludeAllJobs BIT = 0  -- 0 = Issues only, 1 = All jobs
 AS
 BEGIN
-    WITH ReportData AS (
-        SELECT * FROM vw_expert_job_monitoring
-    )
+    SET NOCOUNT ON;
+    
+    DECLARE @reportDate DATE = CAST(GETDATE() AS DATE);
+    DECLARE @yesterdayDate DATE = DATEADD(DAY, -1, @reportDate);
+    DECLARE @windowStart DATETIME = CAST(@yesterdayDate AS DATETIME) + '06:00';
+    DECLARE @windowEnd DATETIME = CAST(@reportDate AS DATETIME) + '06:00';
+    
+    DECLARE @subject NVARCHAR(255);
+    DECLARE @tableHTML NVARCHAR(MAX);
+    
+    -- Get summary counts for subject line
+    DECLARE @totalJobs INT, @completedJobs INT, @failedJobs INT, @missedJobs INT;
+    
     SELECT 
-        JobName AS [Job Name],
-        ScheduleType AS [Schedule Type],
-        CONVERT(VARCHAR(8), ScheduledTime, 108) AS [Scheduled Time],
-        CASE 
-            WHEN NextExpectedRun IS NOT NULL 
-            THEN CONVERT(VARCHAR(16), NextExpectedRun, 120)
-            ELSE 'N/A'
-        END AS [Next Expected Run],
-        CASE 
-            WHEN LastRunStart IS NOT NULL 
-            THEN CONVERT(VARCHAR(16), LastRunStart, 120)
-            ELSE 'Never'
-        END AS [Last Run Start],
-        CASE 
-            WHEN LastRunEnd IS NOT NULL 
-            THEN CONVERT(VARCHAR(16), LastRunEnd, 120)
-            WHEN LastRunStatus = 'RUNNING' THEN 'Still Running'
-            ELSE 'N/A'
-        END AS [Last Run End],
-        LastRunStatus AS [Last Status],
-        LastRunDuration AS [Last Duration],
-        CurrentStatus AS [Current Status],
-        TimeSinceLastRun AS [Time Since Last Run],
-        ActionRequired AS [Action Required]
-    FROM ReportData
-    WHERE @IncludeAllJobs = 1 
-       OR CurrentStatus NOT IN ('✅ RAN TODAY', '✅ RAN YESTERDAY', '✅ ONE-TIME JOB COMPLETED')
-    ORDER BY 
-        CASE 
-            WHEN CurrentStatus LIKE '%MISSED%' THEN 1
-            WHEN CurrentStatus LIKE '%FAILED%' THEN 2
-            WHEN CurrentStatus LIKE '%OVERDUE%' THEN 3
-            ELSE 4
-        END,
-        [Scheduled Time];
+        @totalJobs = COUNT(*),
+        @completedJobs = COUNT(CASE WHEN Status24H LIKE '✅%' THEN 1 END),
+        @failedJobs = COUNT(CASE WHEN Status24H LIKE '❌%' OR Status24H LIKE '🔴%' THEN 1 END),
+        @missedJobs = COUNT(CASE WHEN Status24H LIKE '%MISSED%' THEN 1 END)
+    FROM vw_daily_0600_job_report;
+    
+    SET @subject = 'Daily Job Report ' + CONVERT(VARCHAR(10), @yesterdayDate, 103) + 
+                   ' 06:00-' + CONVERT(VARCHAR(5), @windowEnd, 108) + 
+                   ' | ' + CAST(@completedJobs AS VARCHAR) + ' OK, ' + 
+                   CAST(@failedJobs AS VARCHAR) + ' Issues';
+    
+    -- Build HTML report
+    SET @tableHTML = 
+        N'<html>
+        <head>
+            <style>
+                body { font-family: Calibri, Arial, sans-serif; }
+                h2 { color: #2c3e50; }
+                h3 { color: #3498db; }
+                table { border-collapse: collapse; width: 100%; margin: 10px 0; }
+                th { background-color: #34495e; color: white; padding: 10px; text-align: left; }
+                td { border: 1px solid #ddd; padding: 8px; }
+                tr:nth-child(even) { background-color: #f8f9fa; }
+                .attention { background-color: #fff3cd !important; border-left: 4px solid #ffc107; }
+                .failed { background-color: #f8d7da !important; border-left: 4px solid #dc3545; }
+                .success { background-color: #d4edda !important; border-left: 4px solid #28a745; }
+                .summary-box { 
+                    background-color: #e8f4fd; 
+                    border: 1px solid #b6d4fe; 
+                    padding: 15px; 
+                    margin: 15px 0; 
+                    border-radius: 5px;
+                }
+            </style>
+        </head>
+        <body>
+        <h2>📊 Daily Job Status Report</h2>
+        <div class="summary-box">
+            <h3>📅 Report Window: ' + CONVERT(VARCHAR(16), @windowStart, 120) + ' to ' + 
+                     CONVERT(VARCHAR(16), @windowEnd, 120) + '</h3>
+            <p><strong>Summary:</strong></p>
+            <ul>
+                <li>Total Jobs Monitored: ' + CAST(@totalJobs AS VARCHAR) + '</li>
+                <li>✅ Successfully Completed: ' + CAST(@completedJobs AS VARCHAR) + '</li>
+                <li>⚠️ Requiring Attention: ' + CAST(@failedJobs AS VARCHAR) + '</li>
+                <li>⏰ Missed Executions: ' + CAST(@missedJobs AS VARCHAR) + '</li>
+            </ul>
+        </div>';
+    
+    -- Add jobs table based on filter
+    IF @IncludeAllJobs = 1
+    BEGIN
+        SET @tableHTML = @tableHTML + 
+            N'<h3>All Jobs Status</h3>' +
+            N'<table>
+                <tr>
+                    <th>Job Name</th>
+                    <th>Schedule</th>
+                    <th>Time</th>
+                    <th>Status (24h)</th>
+                    <th>Last Run</th>
+                    <th>Duration</th>
+                    <th>Action Required</th>
+                </tr>' +
+            CAST( (
+                SELECT 
+                    td = JobName, '',
+                    td = ScheduleType, '',
+                    td = ScheduledTime, '',
+                    td = Status24H, '',
+                    td = ISNULL(CONVERT(VARCHAR(16), LastRunStart, 120), 'Not Run'), '',
+                    td = ISNULL(LastRunDuration, 'N/A'), '',
+                    td = ActionItem
+                FROM vw_daily_0600_job_report
+                ORDER BY 
+                    CASE 
+                        WHEN Status24H LIKE '%MISSED%' THEN 1
+                        WHEN Status24H LIKE '%FAILED%' THEN 2
+                        WHEN Status24H LIKE '✅%' THEN 3
+                        ELSE 4
+                    END,
+                    ScheduledTime
+                FOR XML PATH('tr'), TYPE 
+            ) AS NVARCHAR(MAX) ) +
+            N'</table>';
+    END
+    ELSE
+    BEGIN
+        SET @tableHTML = @tableHTML + 
+            N'<h3>⚠️ Jobs Requiring Attention</h3>' +
+            N'<table>
+                <tr>
+                    <th>Job Name</th>
+                    <th>Schedule</th>
+                    <th>Time</th>
+                    <th>Status</th>
+                    <th>Last Run</th>
+                    <th>Action Required</th>
+                </tr>' +
+            CAST( (
+                SELECT 
+                    td = JobName, '',
+                    td = ScheduleType, '',
+                    td = ScheduledTime, '',
+                    td = Status24H, '',
+                    td = ISNULL(CONVERT(VARCHAR(16), LastRunStart, 120), 'Not Run'), '',
+                    td = ActionItem
+                FROM vw_daily_0600_job_report
+                WHERE Status24H NOT LIKE '✅%' 
+                  AND Status24H != 'ℹ️ NOT EXPECTED IN REPORT WINDOW'
+                ORDER BY 
+                    CASE 
+                        WHEN Status24H LIKE '%MISSED%' THEN 1
+                        WHEN Status24H LIKE '%FAILED%' THEN 2
+                        ELSE 3
+                    END,
+                    ScheduledTime
+                FOR XML PATH('tr'), TYPE 
+            ) AS NVARCHAR(MAX) ) +
+            N'</table>';
+    END
+    
+    SET @tableHTML = @tableHTML + 
+        N'<br/><hr/>
+        <p style="color: #666; font-size: 12px;">
+            Report generated at: ' + CONVERT(VARCHAR, GETDATE(), 120) + '<br/>
+            Window: ' + CONVERT(VARCHAR(16), @windowStart, 120) + ' to ' + 
+                     CONVERT(VARCHAR(16), @windowEnd, 120) + '
+        </p>
+        </body></html>';
+    
+    -- Send email
+    EXEC msdb.dbo.sp_send_dbmail
+        @profile_name = 'Database Mail Profile',
+        @recipients = @RecipientEmail,
+        @subject = @subject,
+        @body = @tableHTML,
+        @body_format = 'HTML',
+        @importance = CASE WHEN @failedJobs > 0 THEN 'High' ELSE 'Normal' END;
+    
+    PRINT 'Report sent to ' + @RecipientEmail;
 END
 GO
-
--- Usage:
--- For full report: EXEC sp_GetExpertJobReport @IncludeAllJobs = 1;
--- For issues only: EXEC sp_GetExpertJobReport @IncludeAllJobs = 0;
