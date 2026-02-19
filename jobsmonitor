@@ -1,0 +1,314 @@
+– ============================================================
+– SOLUTION: Daily Job Execution Monitor & Email Report
+– Runs every day at 06:00 AM via SQL Server Agent
+– Reports job execution status for the last 24 hours
+– (Yesterday 06:00 AM → Today 06:00 AM)
+– Author  : Generated for gal4489@jac.mil.ae
+– ============================================================
+
+– ============================================================
+– STEP 1: CREATE THE STORED PROCEDURE
+– ============================================================
+
+USE [YourDatabaseName]  – ← Replace with your actual database name
+GO
+
+IF OBJECT_ID(‘dbo.usp_DailyJobExecutionReport’, ‘P’) IS NOT NULL
+DROP PROCEDURE dbo.usp_DailyJobExecutionReport
+GO
+
+CREATE PROCEDURE dbo.usp_DailyJobExecutionReport
+AS
+BEGIN
+SET NOCOUNT ON;
+
+```
+-- --------------------------------------------------------
+-- Define the 24-hour reporting window
+-- Window: Yesterday 06:00 AM → Today 06:00 AM
+-- --------------------------------------------------------
+DECLARE @WindowStart    DATETIME = DATEADD(HOUR, 6, CAST(CAST(GETDATE() AS DATE) AS DATETIME) - 1);
+DECLARE @WindowEnd      DATETIME = DATEADD(HOUR, 6, CAST(CAST(GETDATE() AS DATE) AS DATETIME));
+DECLARE @ReportDate     VARCHAR(30) = CONVERT(VARCHAR, GETDATE(), 113);
+
+-- --------------------------------------------------------
+-- Fetch active daily schedules and their last execution
+-- within the 24-hour window. Same job can appear multiple
+-- times if it has multiple schedules.
+-- --------------------------------------------------------
+;WITH ActiveSchedules AS
+(
+    -- All active daily schedules
+    SELECT
+        s.id_                                                    AS ScheduleId,
+        s.proc_def_id                                            AS JobName,
+        CONVERT(TIME, s.date_time_)                              AS ScheduledTime
+    FROM dbo.adm_trn_jm_active_schedule s
+    WHERE s.period_    = 'Day'
+      AND s.disabled_  = 0
+      AND s.removed_   = 0
+),
+LastExecution AS
+(
+    -- Most recent execution per schedule within the window
+    SELECT
+        ji.schedule_id_                                          AS ScheduleId,
+        ji.proc_def_                                             AS JobName,
+        ji.start_                                                AS StartTime,
+        ji.finish_                                               AS FinishTime,
+        ji.Status_                                               AS ExecutionStatus,
+        ROW_NUMBER() OVER (
+            PARTITION BY ji.schedule_id_
+            ORDER BY ji.start_ DESC
+        )                                                        AS RowNum
+    FROM dbo.adm_trn_job_instances ji
+    WHERE ji.start_ >= @WindowStart
+      AND ji.start_ <  @WindowEnd
+)
+SELECT
+    a.JobName                                                    AS [Job Name],
+    CONVERT(VARCHAR(8), a.ScheduledTime, 108)                    AS [Scheduled Time],
+    CASE
+        WHEN e.StartTime  IS NULL THEN 'N/A'
+        ELSE CONVERT(VARCHAR(19), e.StartTime,  120)
+    END                                                          AS [Start Time],
+    CASE
+        WHEN e.FinishTime IS NULL THEN 'N/A'
+        ELSE CONVERT(VARCHAR(19), e.FinishTime, 120)
+    END                                                          AS [Finish Time],
+    CASE
+        WHEN e.StartTime IS NULL OR e.FinishTime IS NULL THEN 'N/A'
+        ELSE
+            CAST(DATEDIFF(SECOND, e.StartTime, e.FinishTime) / 3600   AS VARCHAR) + 'h ' +
+            CAST((DATEDIFF(SECOND, e.StartTime, e.FinishTime) % 3600) / 60 AS VARCHAR) + 'm ' +
+            CAST(DATEDIFF(SECOND, e.StartTime, e.FinishTime) % 60     AS VARCHAR) + 's'
+    END                                                          AS [Duration],
+    ISNULL(e.ExecutionStatus, 'Not Run')                         AS [Status],
+    a.ScheduleId
+INTO #JobReport
+FROM ActiveSchedules a
+LEFT JOIN LastExecution e
+    ON  e.ScheduleId = a.ScheduleId
+    AND e.RowNum     = 1
+ORDER BY a.JobName, a.ScheduledTime;
+
+-- --------------------------------------------------------
+-- Build the HTML email body
+-- --------------------------------------------------------
+DECLARE @TotalJobs      INT = (SELECT COUNT(*)    FROM #JobReport);
+DECLARE @SuccessCount   INT = (SELECT COUNT(*)    FROM #JobReport WHERE [Status] = 'Success');
+DECLARE @FailedCount    INT = (SELECT COUNT(*)    FROM #JobReport WHERE [Status] = 'Failed');
+DECLARE @NotRunCount    INT = (SELECT COUNT(*)    FROM #JobReport WHERE [Status] = 'Not Run');
+DECLARE @OtherCount     INT = (SELECT COUNT(*)    FROM #JobReport WHERE [Status] NOT IN ('Success','Failed','Not Run'));
+
+DECLARE @TableRows      NVARCHAR(MAX) = N'';
+DECLARE @HTMLBody       NVARCHAR(MAX) = N'';
+
+-- Build one HTML row per job
+SELECT @TableRows = @TableRows +
+    N'<tr>' +
+        N'<td style="padding:8px 12px;border-bottom:1px solid #e0e0e0;">' + [Job Name]      + N'</td>' +
+        N'<td style="padding:8px 12px;border-bottom:1px solid #e0e0e0;text-align:center;">' + [Scheduled Time] + N'</td>' +
+        N'<td style="padding:8px 12px;border-bottom:1px solid #e0e0e0;text-align:center;">' + [Start Time]     + N'</td>' +
+        N'<td style="padding:8px 12px;border-bottom:1px solid #e0e0e0;text-align:center;">' + [Finish Time]    + N'</td>' +
+        N'<td style="padding:8px 12px;border-bottom:1px solid #e0e0e0;text-align:center;">' + [Duration]       + N'</td>' +
+        N'<td style="padding:8px 12px;border-bottom:1px solid #e0e0e0;text-align:center;font-weight:bold;color:' +
+            CASE [Status]
+                WHEN 'Success'    THEN '#2e7d32'   -- green
+                WHEN 'Failed'     THEN '#c62828'   -- red
+                WHEN 'Not Run'    THEN '#757575'   -- grey
+                WHEN 'Terminated' THEN '#e65100'   -- orange
+                WHEN 'Skipped'    THEN '#1565c0'   -- blue
+                ELSE                   '#333333'
+            END + N';">' + [Status] + N'</td>' +
+    N'</tr>'
+FROM #JobReport
+ORDER BY [Job Name], [Scheduled Time];
+
+-- Assemble full HTML
+SET @HTMLBody = N'
+```
+
+<!DOCTYPE html>
+
+<html>
+<head>
+  <meta charset="UTF-8"/>
+</head>
+<body style="margin:0;padding:0;font-family:Segoe UI,Arial,sans-serif;background:#f5f5f5;">
+
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f5;padding:30px 0;">
+    <tr><td align="center">
+      <table width="800" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:6px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.12);">
+
+```
+    <!-- Header -->
+    <tr>
+      <td style="background:#1a3c5e;padding:20px 30px;">
+        <h2 style="margin:0;color:#ffffff;font-size:20px;">&#128197; Daily Job Execution Report</h2>
+        <p  style="margin:4px 0 0;color:#a8c4e0;font-size:13px;">
+          Reporting window: ' + CONVERT(VARCHAR(19), @WindowStart, 120) + ' &nbsp;&rarr;&nbsp; ' + CONVERT(VARCHAR(19), @WindowEnd, 120) + '
+        </p>
+        <p  style="margin:2px 0 0;color:#a8c4e0;font-size:12px;">Report generated: ' + @ReportDate + '</p>
+      </td>
+    </tr>
+
+    <!-- Summary Cards -->
+    <tr>
+      <td style="padding:20px 30px 10px;">
+        <table width="100%" cellpadding="0" cellspacing="0">
+          <tr>
+            <td width="25%" style="padding:0 6px 0 0;">
+              <div style="background:#e8f5e9;border-left:4px solid #2e7d32;border-radius:4px;padding:12px 16px;">
+                <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:0.5px;">Successful</div>
+                <div style="font-size:28px;font-weight:bold;color:#2e7d32;">' + CAST(@SuccessCount AS VARCHAR) + '</div>
+              </div>
+            </td>
+            <td width="25%" style="padding:0 6px;">
+              <div style="background:#ffebee;border-left:4px solid #c62828;border-radius:4px;padding:12px 16px;">
+                <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:0.5px;">Failed</div>
+                <div style="font-size:28px;font-weight:bold;color:#c62828;">' + CAST(@FailedCount AS VARCHAR) + '</div>
+              </div>
+            </td>
+            <td width="25%" style="padding:0 6px;">
+              <div style="background:#f5f5f5;border-left:4px solid #757575;border-radius:4px;padding:12px 16px;">
+                <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:0.5px;">Not Run</div>
+                <div style="font-size:28px;font-weight:bold;color:#757575;">' + CAST(@NotRunCount AS VARCHAR) + '</div>
+              </div>
+            </td>
+            <td width="25%" style="padding:0 0 0 6px;">
+              <div style="background:#e3f2fd;border-left:4px solid #1565c0;border-radius:4px;padding:12px 16px;">
+                <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:0.5px;">Total Schedules</div>
+                <div style="font-size:28px;font-weight:bold;color:#1565c0;">' + CAST(@TotalJobs AS VARCHAR) + '</div>
+              </div>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+
+    <!-- Job Table -->
+    <tr>
+      <td style="padding:16px 30px 30px;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;">
+          <thead>
+            <tr style="background:#1a3c5e;color:#ffffff;">
+              <th style="padding:10px 12px;text-align:left;font-weight:600;">Job Name</th>
+              <th style="padding:10px 12px;text-align:center;font-weight:600;">Scheduled</th>
+              <th style="padding:10px 12px;text-align:center;font-weight:600;">Start Time</th>
+              <th style="padding:10px 12px;text-align:center;font-weight:600;">Finish Time</th>
+              <th style="padding:10px 12px;text-align:center;font-weight:600;">Duration</th>
+              <th style="padding:10px 12px;text-align:center;font-weight:600;">Status</th>
+            </tr>
+          </thead>
+          <tbody>' +
+            @TableRows +
+          N'</tbody>
+        </table>
+      </td>
+    </tr>
+
+    <!-- Footer -->
+    <tr>
+      <td style="background:#f9f9f9;padding:14px 30px;border-top:1px solid #e0e0e0;">
+        <p style="margin:0;font-size:11px;color:#999;text-align:center;">
+          This is an automated report generated by SQL Server Agent. Do not reply to this email.
+        </p>
+      </td>
+    </tr>
+
+  </table>
+</td></tr>
+```
+
+  </table>
+
+</body>
+</html>';
+
+```
+-- --------------------------------------------------------
+-- Send the email via Database Mail
+-- --------------------------------------------------------
+DECLARE @Subject VARCHAR(200) =
+    'Daily Job Report [' + CONVERT(VARCHAR(10), @WindowStart, 120) + '] — ' +
+    CAST(@SuccessCount AS VARCHAR) + ' OK / ' +
+    CAST(@FailedCount  AS VARCHAR) + ' Failed / ' +
+    CAST(@NotRunCount  AS VARCHAR) + ' Not Run';
+
+EXEC msdb.dbo.sp_send_dbmail
+    @profile_name  = 'YourMailProfileName',   -- ← Replace with your Database Mail profile name
+    @recipients    = 'gal4489@jac.mil.ae',
+    @subject       = @Subject,
+    @body          = @HTMLBody,
+    @body_format   = 'HTML';
+
+-- Cleanup
+DROP TABLE IF EXISTS #JobReport;
+```
+
+END
+GO
+
+– ============================================================
+– STEP 2: CREATE THE SQL SERVER AGENT JOB
+– Runs every day at 06:00 AM
+– ============================================================
+
+USE [msdb]
+GO
+
+– Remove existing job with the same name if it exists
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N’Daily ERP Job Execution Report’)
+BEGIN
+EXEC msdb.dbo.sp_delete_job
+@job_name = N’Daily ERP Job Execution Report’,
+@delete_unused_schedule = 1;
+END
+GO
+
+– Create the job
+EXEC msdb.dbo.sp_add_job
+@job_name              = N’Daily ERP Job Execution Report’,
+@enabled               = 1,
+@description           = N’Sends a daily HTML email report of ERP scheduled job execution status for the past 24 hours (06:00 AM to 06:00 AM).’,
+@category_name         = N’[Uncategorized (Local)]’,
+@owner_login_name      = N’sa’;              – ← Replace with appropriate SQL login if needed
+GO
+
+– Add the job step
+EXEC msdb.dbo.sp_add_jobstep
+@job_name        = N’Daily ERP Job Execution Report’,
+@step_name       = N’Execute Job Report Procedure’,
+@step_id         = 1,
+@subsystem       = N’TSQL’,
+@command         = N’EXEC [YourDatabaseName].dbo.usp_DailyJobExecutionReport;’,  – ← Replace DB name
+@database_name   = N’YourDatabaseName’,      – ← Replace with your actual database name
+@on_success_action = 1,   – Quit with success
+@on_fail_action    = 2;   – Quit with failure
+GO
+
+– Add the schedule: Daily at 06:00 AM
+EXEC msdb.dbo.sp_add_jobschedule
+@job_name               = N’Daily ERP Job Execution Report’,
+@name                   = N’Daily at 0600’,
+@enabled                = 1,
+@freq_type              = 4,       – Daily
+@freq_interval          = 1,       – Every 1 day
+@freq_subday_type       = 1,       – Once per day
+@freq_subday_interval   = 0,
+@active_start_time      = 060000;  – 06:00:00 AM
+GO
+
+– Associate job with the local server
+EXEC msdb.dbo.sp_add_jobserver
+@job_name   = N’Daily ERP Job Execution Report’,
+@server_name = N’(LOCAL)’;
+GO
+
+– ============================================================
+– STEP 3: TEST — Run the procedure manually to verify
+– ============================================================
+
+– Uncomment the line below to test immediately:
+– EXEC [YourDatabaseName].dbo.usp_DailyJobExecutionReport;
