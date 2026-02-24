@@ -1,0 +1,32 @@
+-- Verify AG health
+SELECT 
+    ar.replica_server_name,
+    ar.availability_mode_desc,
+    ar.failover_mode_desc,
+    ar.primary_role_allow_connections_desc,
+    ar.secondary_role_allow_connections_desc,
+    ag.name AS ag_name
+FROM sys.availability_replicas ar
+JOIN sys.availability_groups ag ON ar.group_id = ag.group_id
+WHERE ag.name = 'ESPRDAG'
+
+-- Verify databases are synchronized
+SELECT 
+    database_name,
+    synchronization_state_desc,
+    synchronization_health_desc,
+    last_hardened_lsn
+FROM sys.dm_hadr_database_replica_states
+WHERE is_local = 0
+
+-- Test failover if desired
+ALTER AVAILABILITY GROUP ESPRDAG FAILOVER;
+ALTER AVAILABILITY GROUP ESPRDAG FAILOVER; -- Fail back to primary
+
+-- Update database compatibility
+SELECT name, compatibility_level FROM sys.databases
+ALTER DATABASE YourDatabase1 SET COMPATIBILITY_LEVEL = 160
+ALTER DATABASE YourDatabase2 SET COMPATIBILITY_LEVEL = 160
+
+-- Update statistics
+EXEC sp_updatestats
