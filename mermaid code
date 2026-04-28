@@ -1,0 +1,94 @@
+
+mindmap
+  root((AI System))
+    Models
+      LLMs
+      Diffusion
+      Multi-modal
+    Knowledge
+      Parametric (in weights)
+      Non-parametric (external)
+      Cut-off date
+    Memory
+      In-context (short-term)
+      Long-term (vector DB)
+      Episodic / session
+    Tools
+      Web search
+      Code interpreter
+      APIs
+      Calculator
+    Guardrails
+      Content filtering
+      PII masking
+      Alignment prompts
+      Output validation
+    Inference
+      Forward pass
+      Temperature / top-p
+      Structured output
+    Diffusion
+      Forward (noising)
+      Reverse (denoising)
+      Latent space
+    Embeddings
+      Vector representation
+      Similarity search
+    RAG
+      Retrieve
+      Augment
+      Generate
+    Prompt Engineering
+      Zero/few-shot
+      Chain-of-thought
+    Agents
+      ReAct pattern
+      Tool use loop
+    Risks
+      Hallucination
+      Latency vs. cost
+      Data leakage
+
+flowchart TB
+    User([User]) --> Input[Query / Prompt]
+
+    subgraph "AI System Boundary"
+        Input --> Guardrails[Guardrails<br/>Pre-filter]
+        Guardrails --> Orchestrator[Orchestrator<br/>Agent / Router]
+
+        Orchestrator --> Model{Model Core}
+        Model -->|Inference| Output
+
+        subgraph Memory
+            VectorDB[(Vector DB<br/>Long-term memory)]
+            Context[In-context<br/>Short-term]
+        end
+
+        subgraph Tools
+            WebSearch[Web Search]
+            CodeRun[Code Executor]
+            API[External APIs]
+        end
+
+        Model <--> VectorDB
+        Model <--> Context
+        Model -->|Tool calls| Tools
+        Tools -->|Results| Model
+
+        subgraph Knowledge
+            Parametric[Parametric Knowledge<br/>in weights]
+            ExternalDocs[External Docs<br/>via RAG]
+        end
+
+        Model <--> Parametric
+        Model <--> ExternalDocs
+    end
+
+    Output --> PostGuard[Guardrails<br/>Post-filter]
+    PostGuard --> User
+
+    style Model fill:#f9f,stroke:#333
+    style Guardrails fill:#ffcccc
+    style PostGuard fill:#ffcccc
+    style VectorDB fill:#ccf
+    style Tools fill:#ccffcc
